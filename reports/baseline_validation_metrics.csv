@@ -1,0 +1,5 @@
+target,model,MAE,RMSE,sMAPE_percent,validation_observations
+active_vm_count,persistence,0.0,0.0,0.0,50
+active_vm_count,seasonal_naive_12,0.0,0.0,0.0,50
+aggregate_cpu_utilization,persistence,0.15597020180470644,0.19034331627880913,1.649239619408556,50
+aggregate_cpu_utilization,seasonal_naive_12,0.18593455497804282,0.23675671222518285,1.955235225299166,50

@@ -1,0 +1,11 @@
+target,model,MAE,RMSE,sMAPE_percent,validation_observations
+active_vm_count,holt,2.0736479200422762e-12,2.4268345558314346e-12,2.0736479200422765e-14,50
+active_vm_count,moving_average_6,0.0,0.0,0.0,50
+active_vm_count,persistence,0.0,0.0,0.0,50
+active_vm_count,seasonal_naive_12,0.0,0.0,0.0,50
+active_vm_count,ses,0.0,0.0,0.0,50
+aggregate_cpu_utilization,holt,0.11704848286198256,0.15815643823070086,1.2375254618455238,50
+aggregate_cpu_utilization,moving_average_6,0.1048600961063336,0.14725305156075436,1.1105268489037845,50
+aggregate_cpu_utilization,persistence,0.15597020180470644,0.19034331627880913,1.649239619408556,50
+aggregate_cpu_utilization,seasonal_naive_12,0.18593455497804282,0.23675671222518285,1.955235225299166,50
+aggregate_cpu_utilization,ses,0.11006243980814609,0.14721057715692523,1.166219729353302,50
