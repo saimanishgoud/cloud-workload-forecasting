@@ -93,11 +93,8 @@ The forecasting pipeline uses the historical training targets and required forec
 
 ### 2.4 Data Quality and Preprocessing
 
-The project includes data validation and quality-analysis utilities. The forecasting workflow checks for required columns, missing or non-finite target values, duplicate timestamps, chronological ordering, and valid prediction ranges.
+The data-quality report records 1,340,000 rows and five columns in the VM CPU readings dataset. The inspected fields—timestamp, vm_id, min_cpu, max_cpu, and avg_cpu—have zero missing values. No duplicate complete rows were recorded, and 10,000 unique VM IDs were identified. The displayed VM metadata fields also have zero missing values. These checks support the integrity of the inspected fields; they do not, by themselves, establish that every possible data-quality issue is absent.
 
-The output validation also checks that the generated predictions satisfy the submission contract.
-
-The exact findings for every raw-data quality check should be taken from `reports/data_quality_report.csv` and the associated analysis outputs. This report does not assume that all raw-data quality checks passed without examining their recorded results.
 
 ---
 
