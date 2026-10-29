@@ -1,148 +1,110 @@
-# Cloud Workload Forecasting and Analysis
+# Cloud Workload Forecasting
 
-A Python time-series forecasting project that analyzes cloud virtual machine (VM) activity and CPU utilization, evaluates forecasting models, and generates predictions for a two-hour holdout period.
+This project forecasts two things for a set of Azure virtual machines over a two-hour window: how many VMs are active, and what their average CPU utilization will be. It uses a 10,000-VM sample of the Microsoft Azure Public Dataset V2, sampled every five minutes.
 
-## Project Objectives
+The short version of what I found: the workload is very flat in aggregate, a simple moving average beats the "same as last time" baseline, and the fleet average hides a small group of busy VMs that matter more for capacity planning than the average does. The full write-up is in [`reports/final_report.md`](reports/final_report.md).
 
-* Analyze VM-level CPU utilization and workload activity.
-* Aggregate raw observations into timestamp-level forecasting targets.
-* Evaluate forecasting approaches using chronological validation.
-* Compare candidate models against baseline methods.
-* Forecast active VM counts and aggregate CPU utilization.
-* Generate a reproducible `predictions.csv` file.
-* Provide workload insights to support capacity-planning decisions.
+## Results at a glance
 
-## Dataset
+| | Active VM count | Aggregate CPU utilization |
+|---|---|---|
+| Model chosen | Persistence | 6-point moving average |
+| Forecast for all 24 timestamps | 10,000 | 9.19% |
+| Validation MAE (30-min horizon) | 0 | 0.105 pp |
+| Persistence baseline MAE | 0 | 0.156 pp |
 
-This project uses the curated Microsoft Azure Public Dataset V2 VM trace provided for the challenge.
+Two things worth knowing before you read the numbers:
 
-Place the supplied release files in:
+* The VM count is constant at 10,000 because the challenge data only includes VMs with complete traces. It is a feature of how the dataset was built, so a zero error here doesn't say much about the model.
+* Models were selected on a 30-minute validation horizon, but the final forecast covers two hours. The report checks the longer horizon too and is upfront about where the choice is shaky.
 
-```text
-challenge_data/
-```
+## Getting set up
 
-The forecasting pipeline derives two target metrics:
-
-* **`active_vm_count`**: Number of distinct VMs with valid CPU readings at a given timestamp.
-* **`aggregate_cpu_utilization`**: Mean CPU utilization across valid VM readings at a given timestamp, expressed as a percentage from 0 to 100.
-
-The pipeline should derive its targets and timestamps from the supplied data rather than relying on fixed values specific to the public dataset.
-
-## Forecasting Methodology
-
-The project evaluates the following forecasting approaches:
-
-* Persistence forecasting
-* Seasonal-naive forecasting
-* Moving-average forecasting
-* Simple exponential smoothing
-* Holt's trend method
-
-Models are compared using chronological validation and metrics such as:
-
-* **Mean Absolute Error (MAE)**
-* **Root Mean Squared Error (RMSE)**
-* **Symmetric Mean Absolute Percentage Error (sMAPE)**
-
-The selected forecasting approach is evaluated against baseline methods to assess whether it improves predictive performance.
-
-### Preventing Data Leakage
-
-The final 24 target observations constitute the holdout period.
-
-Holdout target values must not be used for model fitting, feature selection, hyperparameter tuning, or model selection. Model selection must be based exclusively on training and validation data available before the holdout.
-
-## Installation
-
-Python 3.11 or later is required.
-
-Install the project and its development dependencies from the repository root:
+You need Python 3.11 or newer.
 
 ```bash
+git clone https://github.com/saimanishgoud/cloud-workload-forecasting.git
+cd cloud-workload-forecasting
+
+python -m venv .venv
+source .venv/bin/activate        # on Windows: .venv\Scripts\activate
+
 python -m pip install -e ".[dev]"
 ```
 
-## Reproducing Predictions
+### The data
 
-Run the forecasting pipeline from the repository root after installing dependencies and placing the supplied release data in `challenge_data/`.
-
-The documented command must regenerate `predictions.csv` from the supplied release data without requiring manual edits to the output file.
-
-> **Reproducibility requirement:** The final command must also work from a clean checkout. It must generate any required intermediate data and model-selection results automatically rather than depending on previously generated files in `reports/`.
-
-The exact command should be documented here after the forecasting pipeline has been verified end to end.
-
-## Required Output
-
-The forecasting pipeline must generate:
-
-```text
-predictions.csv
-```
-
-The CSV must contain exactly these columns, in this order:
-
-```csv
-timestamp,active_vm_count,aggregate_cpu_utilization
-```
-
-### Output Requirements
-
-* Exactly 24 data rows.
-* One prediction for each final holdout timestamp.
-* Timestamps matching the holdout timestamps exactly.
-* Timestamps in chronological order.
-* No duplicate timestamps.
-* No missing predictions.
-* All values finite and numeric.
-* `active_vm_count >= 0`.
-* `aggregate_cpu_utilization` within `[0, 100]`.
-* No additional index column.
-
-The output must be generated automatically by the forecasting pipeline.
-
-## Testing
-
-Run the automated test suite from the repository root:
+The data isn't stored in this repository. Download the `data-v1` release and unpack it into `challenge_data/`:
 
 ```bash
-python -m pytest -q
+curl -L -o data-v1.tar.gz \
+  https://github.com/atomityhq/forecasting-challenge/releases/download/data-v1/data-v1.tar.gz
+tar -xzf data-v1.tar.gz -C challenge_data
+rm data-v1.tar.gz
+
+cd challenge_data && sha256sum -c SHA256SUMS && cd ..
 ```
 
-Tests should verify the forecasting utilities, validation logic, and relevant output requirements.
+After that, `challenge_data/` should contain `vm_cpu_readings.csv.gz`, `vm_metadata.csv.gz`, `DATA_CARD.md` and `SHA256SUMS`, and the checksum check should print `OK` three times.
 
-## Project Structure
+## Generating the predictions
+
+From the repository root:
+
+```bash
+python -m cwfc.build_targets && \
+python -m cwfc.run_model_comparison && \
+python -m cwfc.final_forecast
+```
+
+This builds the two target series from the raw readings, compares the candidate models with rolling-origin validation, picks the best one for each target, and writes `predictions.csv`. It starts from nothing, so it works on a clean checkout and doesn't rely on anything already sitting in `reports/`. On a normal laptop it takes a minute or two, most of it spent loading the 1.3 million-row CPU file.
+
+The output has exactly the columns `timestamp,active_vm_count,aggregate_cpu_utilization` and 24 rows, one for each five-minute timestamp in the final two hours.
+
+## The rest of the analysis
+
+The three commands above are all you need for the predictions. The remaining scripts produce the analysis behind the report and can be run in any order after `build_targets`:
+
+```bash
+python -m cwfc.data_quality               # missing values, duplicates, timestamp gaps
+python -m cwfc.eda                        # exploratory charts
+python -m cwfc.run_baseline_validation    # persistence and seasonal-naive on their own
+python -m cwfc.export_workload_analysis   # Excel workbook and charts
+python -m cwfc.extended_analysis          # 2-hour validation, peak errors, VM tail, segments
+python -m pytest -q                       # unit tests
+```
+
+Everything is written to `reports/`.
+
+## How it works
+
+**Targets.** At every timestamp, `active_vm_count` is the number of distinct VMs with a valid reading, and `aggregate_cpu_utilization` is the average of `avg_cpu` across those VMs. The split is by position: the last 24 timestamps are the holdout, and everything before them (110 timestamps here) is training. The code works out the split from the data instead of hard-coding timestamps.
+
+**Models.** Persistence, seasonal naive, moving average, simple exponential smoothing and Holt's trend method. All of them run at the native five-minute cadence, so there's no resampling step to explain.
+
+**Validation.** Rolling-origin with an expanding window: start with 60 observations, forecast the next 6, move forward by 6, repeat. Nothing is shuffled, and every forecast is scored on data that comes after its training window. The best MAE per target wins.
+
+**No leakage.** The only inputs are past values of the target. The final step reads the holdout *timestamps* to know what to label the predictions, but never the holdout values.
+
+## What's in the repo
 
 ```text
-.
-├── challenge_data/       # Supplied challenge data
-├── reports/              # Analysis outputs, validation metrics, and final report
-├── src/
-│   └── cwfc/              # Data processing, forecasting, and evaluation modules
-├── tests/                 # Automated tests
-├── predictions.csv        # Required prediction output
-├── pyproject.toml         # Project configuration and dependencies
-└── README.md              # Project documentation
+challenge_data/   data release goes here (not committed)
+reports/          generated tables, charts and the final report
+src/cwfc/         the pipeline code
+tests/            unit tests for metrics and validation splits
+predictions.csv   the submission file
+pyproject.toml    dependencies
 ```
 
-## Capacity Planning and Limitations
+## Limitations
 
-Forecasts of VM activity and aggregate CPU utilization can support workload monitoring and capacity-planning decisions.
+* There are only about nine hours of history, so daily or weekly patterns can't be learned or tested.
+* Validation uses a 30-minute horizon while the forecast spans two hours.
+* The VM count never changes in this data, so churn forecasting is untested.
+* The dataset is a stratified sample, not the whole Azure fleet, so the absolute CPU levels shouldn't be generalised.
+* Average CPU says nothing about individual VMs. In this sample the top 5% of VMs account for about 30% of all CPU, so capacity decisions shouldn't be made from the fleet average alone. The report suggests tracking the share of VMs above 80% CPU instead.
 
-However, the available workload history is short and may not capture longer-term trends, recurring patterns, or sudden workload changes. Forecasts should therefore be interpreted alongside uncertainty, infrastructure limits, service-level objectives, and operational headroom requirements.
+## Data and licence
 
-CPU utilization alone is insufficient to determine the exact number of physical servers or the total infrastructure capacity required.
-
-## Repository Hygiene
-
-The repository should not contain:
-
-* Credentials or secrets.
-* Virtual environments.
-* Generated caches.
-* Notebook checkpoints.
-* Large derived datasets.
-* Copies of the upstream Azure release data.
-
-The project should remain reproducible using the supplied challenge data and the documented execution command.
+The data is a curated subset of the [Azure Public Dataset V2](https://github.com/Azure/AzurePublicDataset) and isn't redistributed here. See `SOURCES.md` and `challenge_data/DATA_CARD.md` for attribution. Code is released under the licence in `LICENSE`.
