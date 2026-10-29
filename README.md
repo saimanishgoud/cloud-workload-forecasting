@@ -59,6 +59,8 @@ python -m cwfc.final_forecast
 
 This builds the two target series from the raw readings, compares the candidate models with rolling-origin validation, picks the best one for each target, and writes `predictions.csv`. It starts from nothing, so it works on a clean checkout and doesn't rely on anything already sitting in `reports/`. On a normal laptop it takes a minute or two, most of it spent loading the 1.3 million-row CPU file.
 
+Run them in this order. `build_targets` is the only script that reads the raw data, and it creates the files the other two depend on, so running `final_forecast` first fails with a "file not found" error. If you hit that, start again from `build_targets`.
+
 The output has exactly the columns `timestamp,active_vm_count,aggregate_cpu_utilization` and 24 rows, one for each five-minute timestamp in the final two hours.
 
 ## The rest of the analysis
@@ -75,6 +77,13 @@ python -m pytest -q                       # unit tests
 ```
 
 Everything is written to `reports/`.
+
+## If something goes wrong
+
+* `FileNotFoundError` mentioning `vm_cpu_readings.csv.gz`: the data isn't in `challenge_data/` yet. See "The data" above.
+* `FileNotFoundError` mentioning a file in `reports/`: a step was skipped. Run `build_targets` first, then the others.
+* `No module named cwfc`: activate your virtual environment and run the commands from the repository root.
+* `No module named matplotlib` or `openpyxl`: reinstall with `python -m pip install -e ".[dev]"`.
 
 ## How it works
 
