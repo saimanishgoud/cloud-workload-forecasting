@@ -1,401 +1,283 @@
-# Cloud Workload Forecasting & Analysis
+# Cloud Workload Forecasting & Analysis — Final Report
 
 ## 1. Executive Summary
 
-### Objective
+**Question.** How predictable is this cloud workload, how accurately can the next two hours be forecast, and what should an infrastructure team do with the forecast?
 
-The objective of this project is to analyze historical cloud virtual machine (VM) CPU utilization and forecast two workload indicators over a two-hour horizon:
+**Answer in brief.**
 
-* **Active VM count:** Number of distinct VMs with a valid CPU reading at each timestamp.
-* **Aggregate CPU utilization:** Mean CPU utilization across the VMs with valid readings at each timestamp, expressed as a percentage.
+* **The workload is very stable in aggregate and only weakly predictable beyond ~30 minutes.** Aggregate CPU utilization (mean `avg_cpu` across 10,000 VMs) stayed between 9.11% and 9.91% over the 110 training observations (std 0.19 pp). Errors of a few tenths of a percentage point are therefore a large share of the signal.
+* **Forecast submitted:** 10,000 active VMs and 9.19% aggregate CPU for each of the 24 holdout timestamps (a flat forecast).
+* **Active VM count is constant by construction, not by workload behavior.** The challenge data keeps only VMs that have a complete 134-reading trace, and all 10,000 were created at t=0. Zero churn is therefore a property of the sampling, so the zero validation error for this target says nothing about real VM-count predictability.
+* **Selected models:** persistence for VM count; 6-observation moving average (MA6) for CPU, chosen on rolling-origin validation using training data only.
+* **MA6 beats the persistence baseline** by 32.8% (MAE) at a 30-minute horizon and by 17.6% at the full 2-hour horizon. The gain shrinks with horizon, and all models over-forecast by about 0.2 pp at 2 hours.
+* **Main operational message:** the 9% average hides a heavy tail. The top 5% of VMs carry 30% of all CPU, and 1.3% of VM readings exceed 80%. Capacity decisions should key off tail indicators, not the fleet mean (Section 8).
 
-The project uses a curated subset of the Microsoft Azure Public Dataset V2 VM trace. Observations are available at five-minute intervals. The provided training target series contains 110 observations, while the final forecast requires 24 predictions.
-
-### Approach
-
-The solution implements a reproducible Python forecasting workflow that includes data preparation, workload analysis, baseline forecasting, chronological model validation, model comparison, final prediction generation, and output validation.
-
-Five forecasting approaches were evaluated:
-
-1. Persistence
-2. Seasonal Naive
-3. Moving Average
-4. Simple Exponential Smoothing (SES)
-5. Holt's Exponential Smoothing
-
-The models were compared using Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), and symmetric Mean Absolute Percentage Error (sMAPE).
-
-### Key Findings
-
-The active VM count remained constant at 10,000 throughout the observed training window. Persistence and several other simple models achieved zero validation error for this target.
-
-For aggregate CPU utilization, Moving Average with a six-observation window achieved the lowest validation MAE and sMAPE among the evaluated models.
-
-| CPU validation metric |       Moving Average (6) |
-| --------------------- | -----------------------: |
-| MAE                   | 0.1049 percentage points |
-| RMSE                  | 0.1473 percentage points |
-| sMAPE                 |                   1.111% |
-
-The final prediction file contains 24 chronological rows corresponding to the required forecast timestamps. The previously executed checks confirmed the expected columns, absence of missing values and duplicate timestamps, and compliance with the specified output constraints.
-
-The forecast predicts an active VM count of 10,000 and aggregate CPU utilization of approximately 9.1909% at each of the 24 future timestamps.
-
-**Important qualification:** The reported validation horizon is 30 minutes, whereas the final forecast horizon is two hours. The validation results therefore do not establish the accuracy of the complete two-hour forecast.
+**Honest caveat on model choice.** Selection used a 30-minute validation horizon, as pre-specified. When I later re-ran validation at the true 24-step horizon, a full-history mean beat MA6 (Section 6.2). Because only five overlapping folds exist, I treat this as a flagged limitation rather than a reason to change the submission.
 
 ---
 
 ## 2. Data Understanding and Preprocessing
 
-### 2.1 Dataset Overview
+**Data.** Curated subset of Azure Public Dataset V2: 10,000 VMs × 134 five-minute readings = 1,340,000 rows (`timestamp`, `vm_id`, `min_cpu`, `max_cpu`, `avg_cpu`), plus one metadata row per VM. File checksums were verified against `SHA256SUMS`.
 
-The project uses the curated Azure Public Dataset V2 VM trace supplied with the challenge.
+**Quality checks** (`python -m cwfc.data_quality`):
 
-The provided dataset includes:
+| Check | Result |
+|---|---|
+| Missing values in CPU fields | 0 |
+| Duplicate (timestamp, VM) records | 0 |
+| CPU values outside [0, 100] | 0 |
+| Unique timestamps | 134 (t = 0 to 39,900 s) |
+| Interval between timestamps | 133 of 133 gaps are exactly 300 s |
+| VMs created at t=0 | 10,000 of 10,000 |
 
-* `vm_cpu_readings.csv.gz`: VM-level CPU readings.
-* `vm_metadata.csv.gz`: VM metadata.
-* `DATA_CARD.md`: Dataset documentation.
-* `SHA256SUMS`: File checksum information.
+**What this means.** There are no gaps to impute, so no imputation was done. Every VM is observed at every timestamp. This is a property of how the challenge set was built: only VMs with complete traces were eligible, and selection was stratified by VM category and core bucket. The data is therefore a stratified sample, not a random sample of the Azure fleet, and absolute utilization levels should not be generalized to the whole fleet.
 
-The dataset subset contains 10,000 VMs, with 134 CPU observations per VM at five-minute intervals. This corresponds to approximately 1.34 million VM-level observations and an observation window of approximately 11.1 hours.
+**Target construction** (`python -m cwfc.build_targets`):
 
-The forecasting workflow uses the challenge's training targets rather than treating individual VM readings as independent forecast targets.
+* `active_vm_count` = number of distinct `vm_id` values with a valid reading at the timestamp (each VM counted once).
+* `aggregate_cpu_utilization` = unweighted mean of `avg_cpu` over all VMs at the timestamp, in percent (0–100). A core-weighted mean (using bucket sizes, ">24" taken as 24) would be about 9.3% on average, close to the unweighted 9.4%.
 
-### 2.2 Target Construction
+**Split.** The full 134-point target series is built first. The first 110 observations (t = 0–32,700 s, about 9 h 5 min) are the training window; the last 24 (t = 33,000–39,900 s) are the 2-hour holdout. Native 5-minute cadence is used throughout, so forecasts map one-to-one onto the holdout timestamps with no resampling.
 
-Two aggregate targets are used.
-
-**Active VM count**
-
-At each timestamp, the active VM count is calculated as the number of distinct VMs with a valid CPU reading. Each VM must be counted at most once per timestamp.
-
-**Aggregate CPU utilization**
-
-At each timestamp, aggregate CPU utilization is calculated as the mean of the valid VM-level CPU readings. The resulting value is expressed on a 0–100 percentage scale.
-
-This mean represents the average utilization across the observed VM population. It does not directly measure total CPU consumption, available compute capacity, or the utilization of the busiest individual VM.
-
-### 2.3 Training and Forecast Windows
-
-| Property                    | Value                                                                       |
-| --------------------------- | --------------------------------------------------------------------------- |
-| Training observations       | 110                                                                         |
-| Observation interval        | 5 minutes                                                                   |
-| Training-window duration    | Approximately 9 hours and 10 minutes between the first and last observation |
-| Final forecast observations | 24                                                                          |
-| Forecast horizon            | 2 hours                                                                     |
-| Forecast interval           | 5 minutes                                                                   |
-
-The final 24 timestamps are taken from the supplied holdout timestamp information.
-
-The forecasting pipeline uses the historical training targets and required forecast timestamps. Holdout target values are not used to fit the models or select the forecasting approach.
-
-### 2.4 Data Quality and Preprocessing
-
-The data-quality report records 1,340,000 rows and five columns in the VM CPU readings dataset. The inspected fields—timestamp, vm_id, min_cpu, max_cpu, and avg_cpu—have zero missing values. No duplicate complete rows were recorded, and 10,000 unique VM IDs were identified. The displayed VM metadata fields also have zero missing values. These checks support the integrity of the inspected fields; they do not, by themselves, establish that every possible data-quality issue is absent.
-
+**Leakage control.** Models use only lagged values of the target, which are available at the forecast origin. Holdout targets are never used for fitting, feature choice, or model selection. The final forecaster reads only the holdout *timestamps*.
 
 ---
 
 ## 3. Workload Analysis
 
-### 3.1 Active VM Count
+All numbers in this section use the training window only.
 
-The active VM count remained at 10,000 throughout the 110-observation training series.
+### 3.1 Aggregate level and temporal behavior
 
-This indicates that the aggregated training target does not show changes in the number of VMs with valid readings during the observed period.
+| Property | Value |
+|---|---|
+| Range of aggregate CPU | 9.11% – 9.91% |
+| Median / std | 9.38% / 0.19 pp |
+| Linear trend | −0.013 pp per hour (negligible) |
+| Peak | 9.91% at t = 16,500 s (~4.6 h) |
+| Hourly means (h0 → h9) | 9.41, 9.41, 9.37, 9.36, 9.62, 9.71, 9.37, 9.30, 9.24, 9.14 |
 
-Persistence and Seasonal Naive both achieved zero validation error for active VM count. Moving Average and Simple Exponential Smoothing also achieved zero validation error. Holt's Exponential Smoothing produced only a negligible floating-point error of approximately 2.1 × 10⁻¹².
+The series rises to a mild plateau in hours 4–5, then drifts down. With only about 9 hours of history, no daily or weekly cycle can be identified; the 12-step seasonal-naive model (a 1-hour period) does worse than persistence, which supports the absence of a usable short seasonal pattern.
 
-These results support using a simple persistence forecast for this target. However, a constant historical count does not guarantee that the active VM population will remain unchanged in the future.
+**Key structural fact:** the 5-minute changes have lag-1 autocorrelation of −0.42. In other words the series behaves like a slowly moving level plus independent measurement noise. This explains why averaging the last few points beats copying the last value (Section 6).
 
-### 3.2 Aggregate CPU Utilization
+### 3.2 VM-level distribution (the fleet mean hides a heavy tail)
 
-CPU utilization is the more informative forecasting target in this dataset because its values vary over time, while the observed active VM count remains constant.
+| Statistic | Value |
+|---|---|
+| Median VM reading (`avg_cpu`) | 5.1% |
+| Readings below 5% | 48.9% |
+| 95th / 99th percentile reading | 37.3% / 87.4% |
+| Readings above 50% / above 80% | 3.1% / 1.3% |
+| Share of total CPU carried by the top 5% of VMs | 30.0% |
+| VMs averaging above 50% over the window | 2.2% |
+| VMs with at least one `max_cpu` ≥ 95% | 14.0% |
 
-The initial and final values previously inspected in the training target file were approximately 9.39% and 9.16%, respectively. These observations suggest a modest decline across the observed window, but two endpoints alone are insufficient to establish the complete trend or identify recurring patterns.
+Half of all readings are nearly idle, while a small set of VMs run hot. A fleet average of 9% is fully consistent with a meaningful number of VMs being saturated.
 
-The model comparison results show that Moving Average (6) performed best on validation MAE and sMAPE. Simple Exponential Smoothing achieved a marginally lower RMSE.
+### 3.3 Segments
 
-A moving-average forecast smooths short-term variation by averaging recent observations. This makes it a reasonable candidate for a relatively stable series, although it may respond slowly to sudden changes in workload demand.
+| Segment | VMs | Mean CPU | Std over time |
+|---|---:|---:|---:|
+| **VM category** | | | |
+| Interactive | 3,091 | 11.5% | 0.24 pp |
+| Delay-insensitive | 6,180 | 8.3% | 0.22 pp |
+| Unknown | 729 | 10.4% | 0.63 pp |
+| **Core bucket** | | | |
+| 2 cores | 7,534 | 9.8% | 0.24 pp |
+| 4 cores | 1,908 | 7.9% | 0.19 pp |
+| 8 cores | 486 | 9.7% | 0.42 pp |
+| 24 cores | 62 | 11.4% | 0.41 pp |
+| >24 cores | 10 | 6.6% | 2.00 pp |
 
-### 3.3 Operational Interpretation
+Interactive VMs run about 3 pp hotter than delay-insensitive VMs. Interactive workloads are typically latency-sensitive, so they are the natural first target for headroom rules. Small segments (the 10 largest VMs) are far noisier, which is why aggregate forecasts are much steadier than segment forecasts would be.
 
-The forecasted aggregate CPU utilization is approximately 9.19%. This is a low average relative to the full 0–100 utilization scale.
+### 3.4 What drives the aggregate
 
-However, aggregate CPU utilization should not be interpreted as evidence that every VM has sufficient capacity. A low population average can coexist with high utilization on a subset of VMs.
+The aggregate moves with the bulk of VMs (correlation 0.92 with the mean of the other 95% of VMs) and less with the hot top 5% (correlation 0.71), although that group swings far more on its own (std 1.6 pp versus 0.16 pp). Aggregate stability therefore says little about individual hot VMs.
 
-The available aggregate series also does not, by itself, establish the timing or magnitude of workload spikes, individual VM saturation, or host-level bottlenecks.
+### 3.5 Peak and low-demand periods
 
-Consequently, capacity decisions should incorporate VM-level and host-level telemetry where available.
+Peak demand occurs around hours 4–5 (9.6–9.9%). The lowest values occur at the end of the training window (minimum 9.11% at t = 32,400 s). Differences between peak and low are about 0.8 pp, small in absolute terms.
 
 ---
 
 ## 4. Forecasting Approach
 
-### 4.1 Baseline and Candidate Models
+Candidate models (all at native 5-minute cadence, fitted on past data only):
 
-Five forecasting approaches were evaluated.
+| Model | Description |
+|---|---|
+| Persistence (baseline) | Last observed value |
+| Seasonal naive (12) | Value one hour earlier, repeated |
+| Moving average (3, 6, 12, 24) | Mean of the last *k* observations |
+| Simple exponential smoothing (SES) | Exponentially weighted level (statsmodels, optimized) |
+| Holt | Level + linear trend |
+| Expanding mean | Mean of all history (diagnostic reference) |
 
-| Model                        | Description                                                                                  |
-| ---------------------------- | -------------------------------------------------------------------------------------------- |
-| Persistence                  | Uses the most recent observed value as the forecast.                                         |
-| Seasonal Naive (12)          | Uses a value from 12 observations earlier, corresponding to one hour at five-minute cadence. |
-| Moving Average (6)           | Uses a six-observation window, corresponding to 30 minutes of history.                       |
-| Simple Exponential Smoothing | Produces forecasts using exponentially weighted historical observations.                     |
-| Holt's Exponential Smoothing | Extends exponential smoothing to model a trend component.                                    |
+The five models in the original pipeline are persistence, seasonal-naive, MA6, SES and Holt. MA3, MA12, MA24 and the expanding mean were added in the extended analysis (`python -m cwfc.extended_analysis`) to test sensitivity.
 
-Persistence provides a simple benchmark against which more complex forecasting methods can be evaluated.
+**Selection rule (pre-specified):** lowest rolling-origin MAE per target; RMSE and sMAPE as supporting metrics. For `active_vm_count` all models tie at zero error, so persistence (simplest) is used.
 
-The candidate models were compared using the same chronological validation framework.
-
-### 4.2 Model Selection Criteria
-
-MAE was used as the primary selection metric. RMSE and sMAPE were used as supporting metrics.
-
-* **MAE** measures the average absolute difference between predictions and actual values.
-* **RMSE** penalizes larger errors more strongly because the errors are squared before averaging and taking the square root.
-* **sMAPE** expresses forecast error as a symmetric percentage-based measure.
-
-For CPU utilization, MAE and RMSE are expressed in percentage points because the target is measured on a 0–100 percentage scale.
-
-The selected models were:
-
-* **Active VM count:** Persistence.
-* **Aggregate CPU utilization:** Moving Average (6).
-
-Persistence is appropriate for the observed constant active VM count. Moving Average (6) was selected for CPU utilization because it had the lowest validation MAE and sMAPE among the evaluated candidates.
-
-### 4.3 Final Forecast Generation
-
-After model selection, the forecasting pipeline refits the selected models using the complete available training window and generates predictions for the 24 required timestamps.
-
-The pipeline includes checks for:
-
-* Required training columns.
-* Valid and chronologically ordered observations.
-* Correct prediction timestamps.
-* The required number of forecast rows.
-* Missing and non-finite predictions.
-* Nonnegative active VM counts.
-* CPU utilization within the 0–100 range.
-
-The final output is written to `predictions.csv` without an index column.
+**Final fit:** the selected model is refit on all 110 training observations and projected 24 steps ahead. Output checks enforce column order, 24 rows, holdout timestamps in order, no duplicates, finite values, VM count ≥ 0 and CPU in [0, 100].
 
 ---
 
 ## 5. Validation Methodology
 
-### 5.1 Time-Aware Validation
+Rolling-origin (expanding-window) evaluation on the 110 training observations only, with no shuffling:
 
-The model comparison uses chronological rolling-origin validation rather than a random train-test split.
+| Parameter | Primary (used for selection) | Horizon-matched (diagnostic) |
+|---|---:|---:|
+| Initial training window | 60 | 60 |
+| Forecast horizon | 6 obs (30 min) | 24 obs (2 h) |
+| Step between origins | 6 | 6 |
+| Folds | 9 (last has 2 points) | 5 (overlapping) |
+| Scored forecasts | 50 | 120 |
 
-The initial training window contains 60 observations. Each validation fold forecasts up to six observations, and the origin advances by six observations for the next fold.
+This design only ever scores forecasts on data that comes after the training window, which mirrors production use: refit as new data arrives, forecast ahead. The primary scheme was fixed before the final forecast was produced. The horizon-matched run was added because the final forecast is 2 hours, longer than the 30-minute selection horizon.
 
-| Validation parameter                   |           Value |
-| -------------------------------------- | --------------: |
-| Available training observations        |             110 |
-| Initial training window                | 60 observations |
-| Validation horizon                     |  6 observations |
-| Validation horizon in time             |      30 minutes |
-| Step size                              |  6 observations |
-| Total validation observations reported |              50 |
-
-This design preserves temporal ordering and evaluates models on observations that occur after their respective training windows.
-
-It is more representative of forecasting future workloads than a random split, which could allow observations from later periods to influence model evaluation.
-
-The reported total of 50 validation observations includes the final partial fold. With the current configuration, the first eight folds contain six observations each, while the final fold contains two observations.
-
-### 5.2 Limitations of the Validation Design
-
-The final forecast horizon is 24 observations, equivalent to two hours. The validation horizon is only six observations, equivalent to 30 minutes.
-
-As a result, the reported metrics primarily characterize short-horizon forecasting performance. They do not fully measure the errors that may accumulate over a two-hour forecast.
-
-A stronger final evaluation would use complete 24-step rolling-origin validation folds, provided the training series supports a meaningful comparison. The results should then be compared with the corresponding baseline forecasts.
-
-The small number of observations also limits the range of workload patterns available for evaluating generalization.
+**Percentage metric.** sMAPE is used as a supporting metric. Its denominator is the mean of |actual| and |forecast|; here both are about 9, nowhere near zero, so near-zero instability does not occur.
 
 ---
 
-## 6. Results Versus Baseline
+## 6. Results
 
-### 6.1 Active VM Count Results
+### 6.1 Primary validation (30-minute horizon)
 
-| Model                        |                  MAE |                 RMSE |                sMAPE |
-| ---------------------------- | -------------------: | -------------------: | -------------------: |
-| Moving Average (6)           |               0.0000 |               0.0000 |               0.000% |
-| Persistence                  |               0.0000 |               0.0000 |               0.000% |
-| Seasonal Naive (12)          |               0.0000 |               0.0000 |               0.000% |
-| Simple Exponential Smoothing |               0.0000 |               0.0000 |               0.000% |
-| Holt's Exponential Smoothing | Approximately 0.0000 | Approximately 0.0000 | Approximately 0.000% |
+Aggregate CPU, errors in percentage points:
 
-The tiny errors recorded for Holt's model are numerical floating-point differences rather than meaningful changes in predicted VM count.
+| Model | MAE | RMSE | sMAPE | MAE gain vs persistence |
+|---|---:|---:|---:|---:|
+| MA3 *(extra)* | 0.1035 | 0.1391 | – | +33.6% |
+| **MA6 (selected)** | **0.1049** | 0.1473 | **1.111%** | **+32.8%** |
+| SES | 0.1101 | 0.1472 | 1.166% | +29.4% |
+| Holt | 0.1170 | 0.1582 | 1.238% | +25.0% |
+| MA12 *(extra)* | 0.1368 | 0.1765 | – | +12.3% |
+| **Persistence (baseline)** | 0.1560 | 0.1903 | 1.649% | 0 |
+| Seasonal naive (12) | 0.1859 | 0.2368 | 1.955% | −19.2% |
 
-Because the active VM count remains constant throughout the observed series, a simple persistence forecast is sufficient based on the available validation evidence. There is no demonstrated advantage in using a more complex model for this target.
+* MA6 vs persistence: MAE −32.8%, RMSE −22.6%.
+* The MAE is about 1.1% of the CPU level.
+* MA3 is marginally better than MA6 (0.1035 vs 0.1049), but the difference is well within noise for 50 scored points, so MA6 as originally selected stands.
+* SES has a slightly lower RMSE than MA6 (0.14721 vs 0.14725), also a negligible difference.
 
-### 6.2 CPU Utilization Results
+`active_vm_count`: persistence, seasonal naive, moving average and SES all have exactly zero error; Holt's error is on the order of 10⁻¹² (floating-point noise). As explained in Section 1, this reflects the sampling design of the dataset.
 
-The following table presents the recorded chronological validation metrics for aggregate CPU utilization.
+### 6.2 Horizon-matched validation (2-hour horizon)
 
-| Model                        |    MAE |   RMSE |  sMAPE |
-| ---------------------------- | -----: | -----: | -----: |
-| Moving Average (6)           | 0.1049 | 0.1473 | 1.111% |
-| Simple Exponential Smoothing | 0.1101 | 0.1472 | 1.166% |
-| Holt's Exponential Smoothing | 0.1170 | 0.1582 | 1.238% |
-| Persistence                  | 0.1560 | 0.1903 | 1.649% |
-| Seasonal Naive (12)          | 0.1859 | 0.2368 | 1.955% |
+| Model | MAE | RMSE | Bias (pred − actual) | MAE gain vs persistence |
+|---|---:|---:|---:|---:|
+| Expanding mean *(diagnostic)* | 0.1728 | 0.2010 | +0.086 | +38.3% |
+| MA3 | 0.2235 | 0.2799 | +0.206 | +20.2% |
+| **MA6 (submitted)** | 0.2309 | 0.2865 | +0.221 | +17.6% |
+| SES | 0.2346 | 0.2897 | +0.228 | +16.3% |
+| Persistence | 0.2802 | 0.3322 | +0.277 | 0 |
+| Holt | 0.2854 | 0.3591 | +0.280 | −1.9% |
 
-Moving Average (6) achieved the lowest MAE and sMAPE. Simple Exponential Smoothing achieved a marginally lower RMSE, indicating that it had a slightly lower root mean squared error over the recorded validation observations.
+Observations:
 
-Moving Average (6) was selected because MAE was the primary selection metric and its sMAPE was also the lowest.
-
-### 6.3 Improvement Over Persistence
-
-The Moving Average (6) model outperformed the persistence baseline for aggregate CPU utilization during chronological validation.
-
-Compared with persistence, Moving Average (6) achieved:
-
-* **32.8% reduction in MAE**, from 0.15597 to 0.10486 percentage points.
-* **22.6% reduction in RMSE**, from 0.19034 to 0.14725 percentage points.
-
-The improvements were calculated using the validation metrics:
-
-**MAE improvement:**
-
-$$
-\frac{0.1559702 - 0.1048601}{0.1559702} \times 100 \approx 32.8\%
-$$
-
-**RMSE improvement:**
-
-$$
-\frac{0.1903433 - 0.1472531}{0.1903433} \times 100 \approx 22.6\%
-$$
-
-These results indicate that averaging the six most recent observations reduced forecast errors compared with using the latest observation alone. However, the evaluation covered short-horizon validation windows rather than the full two-hour forecast horizon. Therefore, these improvements demonstrate better performance on the evaluated validation data but do not establish that the Moving Average (6) model will achieve the same improvement over the complete two-hour horizon.
-
-### 6.4 Interpreting sMAPE
-
-sMAPE provides a percentage-based comparison of forecast errors. It is useful alongside MAE and RMSE, but it should not be interpreted in isolation.
-
-Percentage-based metrics can behave poorly when actual and predicted values are near zero. In this dataset, the inspected CPU utilization values are around 9%, rather than near zero, but the metric should still be interpreted alongside absolute errors.
+1. **Accuracy degrades with lead time.** MA6 MAE by lead: 0.12 (steps 1–6), 0.20 (7–12), 0.28 (13–18), 0.31 (19–24) pp. Persistence is worse at every lead.
+2. **The advantage of MA6 over persistence shrinks** from 32.8% (30 min) to 17.6% (2 h). Part of this gain is variance reduction: smoothing removes the noise that persistence copies forward.
+3. **A horizon-matched comparison would favor the full-history mean.** The expanding mean has 25% lower MAE than MA6 at 24 steps (0.173 vs 0.231). This is consistent with a series that fluctuates around a stable level: over two hours, the long-run mean is a better anchor than the last 30 minutes. It rests on five overlapping folds from one 9-hour trace, so I do not treat it as conclusive, and the submission keeps the pre-specified MA6.
+4. **All models over-forecast.** The positive bias (+0.2 pp for MA6) arises because the series fell after its hour 4–5 plateau, so forecasts anchored on recent higher values were too high. For capacity planning this error direction is the conservative one.
 
 ---
 
-## 7. Error Analysis and Failure Considerations
+## 7. Error and Failure Analysis
 
-### 7.1 Observed Validation Errors
+**Peak vs non-peak.** "High load" = actual ≥ 9.496% (75th percentile of the first 60 observations).
 
-Moving Average (6) produced a CPU MAE of approximately 0.1049 percentage points and RMSE of approximately 0.1473 percentage points over the recorded validation observations.
+| Horizon | Period | Model | MAE | Bias | n |
+|---|---|---|---:|---:|---:|
+| 30 min | High load | MA6 | 0.104 | +0.080 | 14 |
+| 30 min | High load | Persistence | 0.146 | +0.139 | 14 |
+| 30 min | Other | MA6 | 0.105 | +0.075 | 36 |
+| 2 h | High load | MA6 | 0.137 | +0.121 | 24 |
+| 2 h | High load | Persistence | 0.178 | +0.174 | 24 |
+| 2 h | Other | MA6 | 0.254 | +0.246 | 96 |
 
-The difference between MAE and RMSE indicates that larger errors contribute more to RMSE than to the average absolute error, as expected. The available aggregate metrics do not, however, identify the exact timestamps or causes of those larger errors.
+MA6 is not worse during peaks. Its largest 2-hour errors occur in the *lower*-demand periods that follow a peak, when it still anchors on the elevated recent level.
 
-The active VM count models achieved effectively zero error because the target remained constant during the observed training and validation periods.
+**Where it fails.** The five largest 30-minute errors are all over-forecasts, the worst being 0.51 pp at t = 22,800 s. The largest ones follow a drop in the utilization level (e.g., 9.67% forecast vs 9.15% actual at the worst point): the moving average lags a turning point by design.
 
-### 7.2 Potential Forecast Failure Modes
+**Structural failure modes.**
 
-Several limitations could affect future performance:
+1. *Turning points:* any smoothing model lags level changes.
+2. *Horizon:* skill over persistence decays with lead time.
+3. *Tail blindness:* a model of the mean says nothing about individual hot VMs.
+4. *Short history:* no daily or weekly cycle can be learned from 9 hours.
+5. *No VM-count dynamics:* because count never changes, the model has never been tested on real churn.
 
-1. **Workload changes:** CPU utilization may increase or decrease more sharply than observed in the training window.
-2. **VM population changes:** New VM activity, shutdowns, or missing telemetry may change the active VM count.
-3. **Longer forecast horizon:** A model that performs well over 30 minutes may not perform as well over two hours.
-4. **Short historical window:** The series may not contain enough history to identify recurring daily or weekly patterns.
-5. **Aggregation effects:** Mean CPU utilization can hide individual VMs that are heavily utilized.
-6. **Model responsiveness:** A moving average can lag sudden changes because it smooths recent observations.
+**Uncertainty.** MA6's 2-hour residuals (prediction − actual) have 5th/50th/95th percentiles of −0.04/+0.22/+0.53 pp. A 90% band calibrated on the early folds covered only 75% of the later folds, so empirical bands from this little history under-cover. I therefore recommend a wider band of **±0.6 pp (about 2 × the 2-hour RMSE of 0.29)** around the forecast, and I flag it as a judgment-based policy parameter.
 
-### 7.3 Recommended Error Analysis
+**Post-hoc holdout check** *(reported after the fact; not used for fitting or selection; alternatives other than the baseline were deliberately not evaluated on the holdout to avoid test-set selection)*:
 
-Before relying on the forecast for operational decisions, the following analyses should be completed using the validation predictions:
+| Model | Forecast | MAE | RMSE | Bias |
+|---|---:|---:|---:|---:|
+| MA6 (submitted) | 9.191 | 0.134 | 0.171 | −0.078 |
+| Persistence (baseline) | 9.165 | 0.147 | 0.185 | −0.104 |
 
-* Plot actual and predicted CPU utilization for each validation fold.
-* Calculate the largest absolute forecast errors.
-* Compare errors during relatively high- and low-utilization periods.
-* Inspect whether forecast errors increase with the forecast lead time.
-* Compare the selected model with persistence over complete 24-step validation horizons.
-* Investigate periods where the active VM count changes, if such periods are available.
-
-The exact peak-period errors and timestamp-specific failure causes have not been established by the aggregate metrics presented in this report.
+The actual holdout CPU ranged from 8.98% to 9.64% (mean 9.27%), and all 24 values fall inside the ±0.6 pp band. The submitted forecast beat persistence by about 9% on MAE. This is better than the validation-based expectation at 2 hours (0.23 MAE) but the holdout is one 2-hour window, so it is a single data point. Active VM count was predicted exactly (10,000).
 
 ---
 
-## 8. Capacity Planning Recommendation
+## 8. Capacity-Planning Recommendation
 
-### 8.1 Forecast-Based Interpretation
+**Principle: size and alert on the tail, use the forecast for drift detection.**
 
-The final forecast predicts aggregate CPU utilization of approximately 9.1909% across the two-hour horizon, with the active VM count remaining at 10,000.
+The forecast says average CPU will stay near 9.2%. On its own that would suggest large unused capacity. The VM-level data says otherwise: the top 5% of VMs carry 30% of CPU, 14% of VMs touched ≥95% peak CPU in the 9-hour window, and every timestamp has 1.1–1.5% of VMs above 80%. Consolidating on the mean would hit those VMs.
 
-This provides a short-term indication of average utilization under the selected forecasting approach. It should not be treated as a guarantee that future utilization will remain at this level.
+**Proposed policy** (all thresholds are assumptions to be tuned to the team's service-level objectives):
 
-The current forecast is most useful as an additional signal for workload monitoring and planning, rather than as the sole input to automated scaling or resource removal.
+1. **Do not remove or consolidate capacity based on the fleet average.** Use the forecast as a monitoring baseline.
+2. **Drift trigger (aggregate).** Flag for review if actual aggregate CPU exceeds the forecast by more than **0.6 pp for 3 consecutive 5-minute intervals** (15 minutes). In the training window such a gap would essentially never occur, so this detects a genuine regime shift rather than ordinary noise.
+3. **Tail trigger (the important one).** Normal range for the share of VMs above 80% CPU is 1.1–1.5%. Investigate hot VMs when the share exceeds **2%** for 3 consecutive intervals (≈1.4 × the observed maximum). Also track the per-timestamp 99th percentile (normally 82–91%).
+4. **Segment rule.** Interactive VMs (11.5% mean CPU, latency-sensitive) get headroom and alerting first. Delay-insensitive VMs (8.3%) can tolerate queuing and are the first candidates for batching or consolidation, subject to rule 3.
+5. **Prefer small, reversible steps.** Scale out in increments and re-forecast every 5 minutes.
+6. **VM count.** Treat "10,000" as an assumption; in production, VM churn must be forecast separately.
 
-### 8.2 Over-Provisioning and Under-Provisioning
-
-**Over-provisioning** occurs when more compute capacity is allocated than the workload requires. It can increase infrastructure expenditure and leave resources underutilized.
-
-**Under-provisioning** occurs when available capacity is insufficient for demand. It can lead to high utilization, increased latency, degraded performance, failed workloads, or service interruptions.
-
-Capacity planning must balance these costs. A low aggregate utilization forecast may suggest an opportunity to investigate resource efficiency, but it is not sufficient evidence to remove capacity without examining individual VM and host utilization.
-
-### 8.3 Recommended Operational Actions
-
-1. Monitor actual CPU utilization against the forecast at each five-minute interval.
-2. Evaluate per-VM and host-level utilization before scaling resources.
-3. Use historical forecast errors to estimate an appropriate safety margin.
-4. Assess the impact of under-provisioning on workload performance and service objectives.
-5. Prefer incremental, reversible capacity changes where operationally appropriate.
-6. Re-evaluate the model when workload patterns or VM population characteristics change.
-
-### 8.4 Safety Margin Assumptions
-
-This report does not prescribe a fixed utilization threshold or safety margin because the available results do not establish an appropriate operational threshold for this workload.
-
-Any threshold should be treated as an explicit policy assumption and justified using forecast errors, workload criticality, service-level objectives, and the consequences of capacity shortages.
-
-A production deployment should consider prediction intervals or other uncertainty estimates, rather than relying exclusively on point forecasts.
+**Trade-off.** Under-provisioning risks latency, throttling and failures, with immediate user impact. Over-provisioning wastes spend and is easy to reverse. At a 9% average utilization the cost asymmetry favors keeping headroom for the tail. The forecast's over-forecasting bias (+0.2 pp at 2 hours) errs toward more capacity, the safer direction.
 
 ---
 
 ## 9. Limitations and Future Work
 
-### Limitations
+**Limitations**
 
-The solution has several limitations:
+* Only 9 hours of training history, so there is no seasonality evidence and only five (overlapping) 2-hour folds.
+* Model selection used a 30-minute horizon; the 2-hour check favors a different model (full-history mean).
+* VM count is constant by dataset construction, so churn forecasting is untested.
+* The sample is a stratified subset of the fleet, not the whole fleet.
+* The ±0.6 pp band and all trigger thresholds are policy assumptions, not statistically calibrated.
+* The holdout check is a single 2-hour window.
 
-* Only 110 aggregate training observations are available.
-* The training series covers approximately 9 hours and 10 minutes between the first and last observations.
-* The initial validation horizon is 30 minutes, shorter than the final two-hour forecast.
-* The active VM count remains constant throughout the observed training series, limiting the evidence for predicting VM population changes.
-* Aggregate mean CPU utilization can conceal localized utilization peaks.
-* The current forecasts do not quantify uncertainty.
-* The reported metrics do not provide a complete timestamp-level analysis of peak errors.
+**Future work**
 
-### Future Work
-
-The following improvements would strengthen the forecasting solution:
-
-1. **Longer-horizon validation:** Evaluate models using complete 24-step rolling-origin folds.
-2. **Expanded error analysis:** Inspect forecast errors by timestamp, forecast lead time, and workload level.
-3. **Uncertainty estimation:** Add prediction intervals to communicate the range of plausible future utilization.
-4. **Additional features:** Where available and justified, investigate time-of-day effects, VM metadata, workload categories, and lagged CPU values.
-5. **Dynamic VM count forecasting:** Evaluate models on periods where active VM counts actually change.
-6. **Operational monitoring:** Compare forecasts with incoming telemetry and establish a process for detecting sustained forecast deviations.
-7. **Reproducibility:** Maintain documented installation instructions, deterministic preprocessing, automated validation, and a repeatable forecasting command.
-
-Any additional model should be retained only if it demonstrates a meaningful improvement under an appropriate chronological validation scheme.
+1. Select models using 24-step folds (or horizon-weighted loss) and re-run with a longer history.
+2. Add quantile/conformal intervals once more history exists.
+3. Forecast tail indicators directly (share of VMs >80%, p99), since the operational policy depends on them.
+4. Forecast by segment (interactive vs delay-insensitive) with hierarchical reconciliation.
+5. Evaluate on traces with real VM creation and deletion.
+6. Add time-of-day and day-of-week features once multi-day data is available.
 
 ---
 
-## 10. Conclusion
+## 10. Reproducibility
 
-This project implements a reproducible workflow for analyzing cloud workload targets and forecasting active VM count and aggregate CPU utilization.
+```bash
+python -m pip install -e ".[dev]"        # pyproject.toml must list matplotlib and openpyxl
+python -m cwfc.build_targets
+python -m cwfc.data_quality
+python -m cwfc.eda
+python -m cwfc.run_baseline_validation
+python -m cwfc.run_model_comparison
+python -m cwfc.final_forecast            # writes predictions.csv
+python -m cwfc.export_workload_analysis
+python -m cwfc.extended_analysis         # numbers in Sections 3, 6.2, 7 and 8
+python -m pytest -q
+```
 
-The recorded validation results support persistence for active VM count and Moving Average (6) for CPU utilization. The selected CPU model improved validation MAE by approximately 32.8% relative to persistence under the current short-horizon evaluation.
-
-The final prediction file contains the required 24 timestamps and satisfies the previously checked structural and value constraints.
-
-However, the two-hour forecast horizon exceeds the current 30-minute validation horizon. Longer-horizon validation and timestamp-level error analysis are therefore important before using these predictions to make capacity allocation decisions.
-
-The main conclusion is that simple time-series methods provide a reasonable starting point for this dataset, but operational deployment requires stronger evidence about longer-horizon accuracy, workload variability, and forecast uncertainty.
+Verified on a clean clone: the pipeline regenerates `predictions.csv` identically to the committed file.
