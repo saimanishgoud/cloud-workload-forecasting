@@ -254,30 +254,28 @@ Moving Average (6) was selected because MAE was the primary selection metric and
 
 ### 6.3 Improvement Over Persistence
 
-Relative to the persistence baseline, Moving Average (6) achieved approximately:
+The Moving Average (6) model outperformed the persistence baseline for aggregate CPU utilization during chronological validation.
 
-* **32.8% lower MAE**
-* **22.6% lower RMSE**
+Compared with persistence, Moving Average (6) achieved:
 
-These improvements are calculated from the recorded validation metrics:
+* **32.8% reduction in MAE**, from 0.15597 to 0.10486 percentage points.
+* **22.6% reduction in RMSE**, from 0.19034 to 0.14725 percentage points.
 
-$$
-\text{MAE improvement}
-=
-\frac{0.1559702 - 0.1048601}{0.1559702}
-\times 100
-\approx 32.8\%
-$$
+The improvements were calculated using the validation metrics:
+
+**MAE improvement:**
 
 $$
-\text{RMSE improvement}
-=
-\frac{0.1903433 - 0.1472531}{0.1903433}
-\times 100
-\approx 22.6\%
+\frac{0.1559702 - 0.1048601}{0.1559702} \times 100 \approx 32.8\%
 $$
 
-These improvements apply to the reported short-horizon validation results. They should not be interpreted as established improvements over the full two-hour forecast horizon.
+**RMSE improvement:**
+
+$$
+\frac{0.1903433 - 0.1472531}{0.1903433} \times 100 \approx 22.6\%
+$$
+
+These results indicate that averaging the six most recent observations reduced forecast errors compared with using the latest observation alone. However, the evaluation covered short-horizon validation windows rather than the full two-hour forecast horizon. Therefore, these improvements demonstrate better performance on the evaluated validation data but do not establish that the Moving Average (6) model will achieve the same improvement over the complete two-hour horizon.
 
 ### 6.4 Interpreting sMAPE
 
