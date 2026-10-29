@@ -72,7 +72,6 @@ python -m cwfc.data_quality               # missing values, duplicates, timestam
 python -m cwfc.eda                        # exploratory charts
 python -m cwfc.run_baseline_validation    # persistence and seasonal-naive on their own
 python -m cwfc.export_workload_analysis   # Excel workbook and charts
-python -m cwfc.extended_analysis          # 2-hour validation, peak errors, VM tail, segments
 python -m pytest -q                       # unit tests
 ```
 
