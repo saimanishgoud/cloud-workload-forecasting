@@ -1,3 +1,4 @@
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -10,7 +11,9 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.0",
-    "statsmodels>=0.14"
+    "statsmodels>=0.14",
+    "matplotlib>=3.8",
+    "openpyxl>=3.1"
 ]
 
 [project.optional-dependencies]
